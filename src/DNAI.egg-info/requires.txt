@@ -1,0 +1,13 @@
+matplotlib
+seaborn
+pandas
+openpyxl
+scikit-learn
+krippendorff
+statsmodels
+umap-learn
+scikit-learn
+prince
+nbformat
+xgboost
+shap

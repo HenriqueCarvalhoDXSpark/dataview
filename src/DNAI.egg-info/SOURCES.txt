@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/DNAI/__init__.py
+src/DNAI.egg-info/PKG-INFO
+src/DNAI.egg-info/SOURCES.txt
+src/DNAI.egg-info/dependency_links.txt
+src/DNAI.egg-info/requires.txt
+src/DNAI.egg-info/top_level.txt
+src/DNAI/utils/__init__.py
+src/DNAI/utils/paths.py

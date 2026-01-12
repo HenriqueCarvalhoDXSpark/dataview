@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: DNAI
+Version: 0.1.0
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: pandas
+Requires-Dist: openpyxl
+Requires-Dist: scikit-learn
+Requires-Dist: krippendorff
+Requires-Dist: statsmodels
+Requires-Dist: umap-learn
+Requires-Dist: scikit-learn
+Requires-Dist: prince
+Requires-Dist: nbformat
+Requires-Dist: xgboost
+Requires-Dist: shap
