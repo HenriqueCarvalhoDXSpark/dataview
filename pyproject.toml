@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DNAI"
+version = "0.1.0"
+dependencies = [
+    "matplotlib",
+    "seaborn",
+    "pandas",
+    "openpyxl",
+    "torch",
+    "scikit-learn",
+    "krippendorff",
+    "nltk",
+    "spacy",
+    "umap-learn",
+    "scikit-learn",
+    "prince",
+    "nbformat",
+    "xgboost",
+    "shap"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
