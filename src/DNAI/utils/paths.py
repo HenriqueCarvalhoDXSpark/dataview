@@ -1,4 +1,7 @@
 from pathlib import Path
+import shutil
+import os
+import glob
 
 # ------------------------------------------------------------------------------
 # Project root resolution
@@ -60,3 +63,45 @@ for _dir in _REQUIRED_DIRS:
             f"Required directory does not exist: {_dir}\n"
             "Did you run the code from the project root?"
         )
+
+
+def find_rscript_exe() -> str:
+    """
+    Return a usable path to Rscript.exe.
+    Search order:
+      1) PATH (shutil.which)
+      2) Environment variable RSCRIPT_EXE
+      3) Common Windows install directories under Program Files
+    """
+    # 1) PATH
+    exe = shutil.which("Rscript")
+    if exe:
+        return exe
+
+    # 2) Explicit environment variable
+    env = os.environ.get("RSCRIPT_EXE")
+    if env and Path(env).exists():
+        return env
+
+    # 3) Common Windows locations (covers most installs)
+    candidates = []
+    for base in [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]:
+        # R installs typically like: C:\Program Files\R\R-4.4.1\bin\Rscript.exe or bin\x64\Rscript.exe
+        candidates += glob.glob(str(Path(base) / "R" / "R-*" / "bin" / "Rscript.exe"))
+        candidates += glob.glob(str(Path(base) / "R" / "R-*" / "bin" / "x64" / "Rscript.exe"))
+
+    # Pick the newest version if multiple found
+    if candidates:
+        candidates = sorted(candidates)  # lexicographic works for R-4.x.y reasonably well
+        return candidates[-1]
+
+    raise FileNotFoundError(
+        "Could not find Rscript.exe.\n"
+        "Fix options:\n"
+        "  - Add R to PATH so `Rscript` works in a terminal, OR\n"
+        "  - Set an environment variable RSCRIPT_EXE to the full path of Rscript.exe.\n"
+        "Example (Windows): setx RSCRIPT_EXE \"C:\\Program Files\\R\\R-4.4.1\\bin\\Rscript.exe\""
+    )

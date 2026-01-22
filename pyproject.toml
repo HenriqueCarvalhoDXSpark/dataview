@@ -18,6 +18,7 @@ dependencies = [
     "umap-learn",
     "scikit-learn",
     "prince",
+    "factor-analyzer",
     "nbformat",
     "xgboost",
     "shap"

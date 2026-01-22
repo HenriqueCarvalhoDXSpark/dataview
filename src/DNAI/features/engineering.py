@@ -7,17 +7,13 @@ import prince
 import plotly.graph_objects as go
 import plotly.express as px
 
-import hdbscan
-import torch
 from sklearn.linear_model import LinearRegression
-from sentence_transformers import SentenceTransformer, util
-model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, AgglomerativeClustering
 
 from nltk.metrics.agreement import AnnotationTask
 from nltk.metrics.distance import masi_distance
 
-import spacy
-nlp = spacy.load("pt_core_news_lg")
 
 def cat_to_numeric(df : pd.DataFrame, cats : list = None) -> pd.DataFrame:
 
@@ -29,70 +25,6 @@ def cat_to_numeric(df : pd.DataFrame, cats : list = None) -> pd.DataFrame:
     cat2id = {c: i for i, c in enumerate(cats)}
 
     return df.map(lambda x: cat2id.get(x, np.nan)).astype(float)
-
-def semantic_similarity(row, label_a, label_b, lemma=False):
-    
-    text1 = row[label_a]
-    text2 = row[label_b]
-
-    if lemma:
-        text1 = lemmatize_list([text1])
-        text2 = lemmatize_list([text2])
-
-    # Encode as tensors
-    emb1 = model.encode(text1, convert_to_tensor=True)
-    emb2 = model.encode(text2, convert_to_tensor=True)
-
-    # Cosine similarity (returns a tensor)
-    sim = util.cos_sim(emb1, emb2)
-
-    return sim.item()
-
-def semantic_similarity_intra(row, labels, lemma=False):
-    
-    #texts = row[labels].fillna('').values
-    texts = row[labels].dropna().values
-
-    if lemma:
-        texts = lemmatize_list(texts)
-
-    emb = model.encode(texts, convert_to_tensor=True)
-
-    sim_matrix = util.cos_sim(emb, emb)
-
-    mask = ~torch.eye(sim_matrix.size(0), dtype=bool)
-
-    vals = sim_matrix[mask]
-
-    if vals.numel() == 0:
-        return np.nan
-    
-    else:
-        return vals.max().item()
-    
-    
-def lemmatize_list(text_list):
-    lemmatized = []
-    for doc in nlp.pipe(text_list, batch_size=32):   # fast vectorized processing
-        lemmas = " ".join([token.lemma_ for token in doc])
-        lemmatized.append(lemmas)
-    return lemmatized
-
-def semantic_similarity_inter(row, labels_a, labels_b, lemma=False):
-
-    textsA = row.loc[labels_a].fillna('').values
-    textsB = row.loc[labels_b].fillna('').values
-    
-    if lemma:
-        textsA = lemmatize_list(textsA)
-        textsB = lemmatize_list(textsB)
-    
-    embA = model.encode(textsA, convert_to_tensor=True)
-    embB = model.encode(textsB, convert_to_tensor=True)
-
-    sim_matrix = util.cos_sim(embA, embB)
-
-    return sim_matrix.mean().item()
 
 def get_fitted(df, label1, label2):
 
@@ -219,133 +151,402 @@ def per_film_entropy(df):
     
     return pd.DataFrame(rows)
 
-def get_mca(X, dimension, df_titles, n_components = 10):
 
-    mca = prince.MCA(n_components=n_components,
-                    n_iter=10,
-                    copy=True,
-                    check_input=True,
-                    engine='sklearn',
-                    random_state=42
-                    )
+def get_binary_matrix(df, cats):
 
-    mca.fit(X)
+    def get_presence_vector(row):
 
-    #X.index = X.index.astype(int)
+        obs = set(row.dropna().values)
 
-    # Row coordinates (films)
-    X_rows = mca.row_coordinates(X)
-    X_rows.columns = [f'Dim{n}' for n in range(1,n_components+1)]
-    X_rows['film_id'] = X.index.astype(int)
+        return np.array([1 if c in obs else 0 for c in cats], dtype=int)
 
-    df_title = pd.merge(X, df_titles, on='film_id')[['film_id','title']]
-    df_title['title'] = df_title['film_id'].astype(str) + ' - ' + df_title['title']
-    df_title.set_index('film_id', inplace=True)
-    X_rows['title'] = df_title['title']
+    b = df.apply(lambda row : get_presence_vector(row), axis = 1)
+    b = b.apply(pd.Series)
+    b.columns = cats
 
-    # Column coordinates (categories / modalities)
-    X_cols = mca.column_coordinates(X)
-    X_cols.columns = [f'Dim{n}' for n in range(1,n_components+1)]
-    X_cols['modality'] = X_cols.index
+    return b
 
-    # Optionally, variance explained
+def get_mca(df_categories, dimension, df_titles, RESULTS_FIGURES_DIR):
+
+    N_COMPONENTS = 10
+    DIM_X, DIM_Y = 0, 1
+
+    # Clustering configuration
+    FILM_N_CLUSTERS = 5
+    CAT_N_CLUSTERS  = 6
+    CLUSTER_METHOD  = "kmeans"  # "kmeans" or "agglomerative"
+
+    # Title column name in df_titles (change if needed)
+    TITLE_COL = "title"
+
+    # Output
+    HTML_OUT = f"{RESULTS_FIGURES_DIR}/mca_{dimension}.html"
+    FIG_OUT = f"{RESULTS_FIGURES_DIR}/mca_{dimension}.png"
+
+    # -------------------------
+    # 1) Minimal cleaning for MCA
+    # -------------------------
+    # Ensure index is film_id
+    _df_categories = df_categories.copy()
+    
+    # drop all-zero categories (important for MCA stability)
+    df_cat = _df_categories.loc[:, _df_categories.sum(axis=0) > 0].astype(float)
+
+    # drop all-zero rows (should not happen, but safe)
+    df_cat = df_cat.loc[df_cat.sum(axis=1) > 0].copy()
+
+    # Align titles with remaining films
+    #df_titles = df_titles.copy()
+    common = df_cat.index.intersection(df_titles.index)
+    df_titles = df_titles.loc[common]
+    df_cat = df_cat.loc[common]
+
+    zero_cols = df_cat.columns[df_cat.sum(axis=0) == 0]
+    df_cat = df_cat.drop(columns=zero_cols).astype(float)
+    # -------------------------
+    # 2) Fit MCA (one_hot=False because df_cat is already indicator-coded)
+    # -------------------------
+    mca = prince.MCA(
+        n_components=N_COMPONENTS,
+        n_iter=20,
+        copy=True,
+        check_input=True,
+        engine="sklearn",
+        random_state=42,
+        one_hot=False
+    ).fit(df_cat)
+
+    film_coords = mca.row_coordinates(df_cat)          # index = film_id, columns = [0..]
+    cat_coords  = mca.column_coordinates(df_cat)       # index = category, columns = [0..]
+    cat_contrib = mca.column_contributions_            # contributions per dimension
+
     eigvals = mca.eigenvalues_
     expl_var = eigvals / eigvals.sum()
     dim1_pct = round(expl_var[0] * 100, 1)
     dim2_pct = round(expl_var[1] * 100, 1)
 
-    X_for_cluster = X_rows[[f'Dim{n}' for n in range(1,n_components+1)]].values
 
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=2,   # tune for your data
-        min_samples=None,      # default = min_cluster_size
-        metric='euclidean'
-    )
+    # -------------------------
+    # 3) Cluster films and categories in MCA space
+    # -------------------------
+    def cluster_points(X: pd.DataFrame, n_clusters: int, method: str = "kmeans", random_state: int = 42):
+        """
+        Cluster points using coordinates (recommended: first few MCA dims).
+        Returns labels as a pd.Series aligned to X.index.
+        """
+        # Use first 5 dims for clustering (typical). Adjust if you prefer.
+        Z = X.iloc[:, :min(5, X.shape[1])].copy()
 
-    film_labels = clusterer.fit_predict(X_for_cluster)
-    X_rows['cluster'] = film_labels
+        # Standardize for clustering stability (particularly if dims have different scales)
+        Zs = StandardScaler().fit_transform(Z.values)
 
-    X_cols_for_cluster = X_cols[[f'Dim{n}' for n in range(1,n_components+1)]].values
+        if method == "kmeans":
+            model = KMeans(n_clusters=n_clusters, n_init=20, random_state=random_state)
+            labels = model.fit_predict(Zs)
+        elif method == "agglomerative":
+            model = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
+            labels = model.fit_predict(Zs)
+        else:
+            raise ValueError("method must be 'kmeans' or 'agglomerative'")
 
-    clusterer_cat = hdbscan.HDBSCAN(
-        min_cluster_size=2,    # typically smaller, fewer modalities
-        metric='euclidean'
-    )
+        return pd.Series(labels, index=X.index, name="cluster")
 
-    cat_labels = clusterer_cat.fit_predict(X_cols_for_cluster)
-    X_cols['cluster'] = cat_labels
+    film_cluster = cluster_points(film_coords, FILM_N_CLUSTERS, method=CLUSTER_METHOD)
+    cat_cluster  = cluster_points(cat_coords,  CAT_N_CLUSTERS,  method=CLUSTER_METHOD)
 
-    # ---- Build color map for film clusters ----
-    film_clusters = X_rows['cluster'].astype(int).unique()
-    film_clusters_sorted = sorted(film_clusters)
 
-    # Use a qualitative palette and cycle if needed
-    palette = px.colors.qualitative.Safe
-    color_map = {cl: palette[i % len(palette)] for i, cl in enumerate(film_clusters_sorted)}
+    # -------------------------
+    # 4) Prepare dataframes for plotting
+    # -------------------------
+    films_plot = film_coords[[DIM_X, DIM_Y]].copy()
+    films_plot.columns = ["Dim1", "Dim2"]
+    films_plot["film_id"] = films_plot.index.astype(str)
+    films_plot = films_plot.join(df_titles[[TITLE_COL]].rename(columns={TITLE_COL: "title"}), how="left")
+    films_plot["film_cluster"] = film_cluster.astype(int).values
 
-    # Optional: special color for noise (-1)
-    if -1 in color_map:
-        color_map[-1] = "#272525"  # light grey for noise
+    cats_plot = cat_coords[[DIM_X, DIM_Y]].copy()
+    cats_plot.columns = ["Dim1", "Dim2"]
+    cats_plot["category"] = cats_plot.index.astype(str)
+    cats_plot["cat_cluster"] = cat_cluster.astype(int).values
 
-    film_colors = X_rows['cluster'].astype(int).map(color_map)
+    # Contribution filter for readable category labeling (optional but recommended)
+    # Keep categories that contribute above-average to Dim1+Dim2
+    contrib_2d = (cat_contrib.iloc[:, DIM_X] + cat_contrib.iloc[:, DIM_Y]).copy()
+    contrib_2d.name = "contrib_2d"
+    cats_plot = cats_plot.join(contrib_2d, how="left")
+    cats_plot["label_me"] = cats_plot["contrib_2d"] > cats_plot["contrib_2d"].mean()
 
-    # ---- Category colors (if you clustered modalities too) ----
-    if 'cluster' in X_cols.columns:
-        cat_clusters = X_cols['cluster'].astype(int).unique()
-        # Reuse the same palette mapping by cluster id
-        cat_colors = X_cols['cluster'].astype(int).map(color_map)
-    else:
-        # If you did not cluster categories, keep them all in one neutral color
-        cat_colors = "#FF7F0E"  # orange
 
-    plt.plot(range(1, len(eigvals)+1), expl_var, marker='o')
-    plt.xlabel("Dimension")
-    plt.ylabel("Explained inertia")
-    plt.title("MCA Scree Plot")
+    # -------------------------
+    # 5) Static Matplotlib figure with subplots (films + categories)
+    # -------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True, constrained_layout=True)
+
+    # Films subplot
+    ax = axes[0]
+    for cl in sorted(films_plot["film_cluster"].unique()):
+        sub = films_plot[films_plot["film_cluster"] == cl]
+        ax.scatter(sub["Dim1"], sub["Dim2"], alpha=0.7, label=f"Cluster {cl}")
+    ax.axhline(0, color = 'k'); ax.axvline(0, color = 'k')
+    ax.set_title("Films")
+    ax.set_xlabel(f"Dim1 ({dim1_pct:.1f}%)")
+    ax.set_ylabel(f"Dim2 ({dim2_pct:.1f}%)")
+    ax.legend(loc="best", fontsize=8)
+
+    # Categories subplot
+    ax = axes[1]
+    for cl in sorted(cats_plot["cat_cluster"].unique()):
+        sub = cats_plot[cats_plot["cat_cluster"] == cl]
+        ax.scatter(sub["Dim1"], sub["Dim2"], alpha=0.8, label=f"Cluster {cl}")
+    # Label only high-contribution categories for readability
+    for _, r in cats_plot[cats_plot["label_me"]].iterrows():
+        ax.text(r["Dim1"], r["Dim2"], r["category"], fontsize=8)
+    ax.axhline(0, color = 'k'); ax.axvline(0, color = 'k')
+    ax.set_title("Categories")
+    ax.set_xlabel(f"Dim1 ({dim1_pct:.1f}%)")
+    ax.set_ylabel(f"Dim2 ({dim2_pct:.1f}%)")
+    ax.legend(loc="best", fontsize=8)
+
+    fig.suptitle(dimension)    
+    fig.savefig(FIG_OUT, dpi=300)
+
     plt.show()
 
-    col_coords = mca.column_coordinates(X)
-    col_contrib = (col_coords**2).div(col_coords**2).sum(axis=1)
 
-    # --- Films (individuals) ---
-    fig = go.Figure()
+    # -------------------------
+    # 6) Interactive Plotly with box/lasso selection + HTML export
+    # -------------------------
 
-    fig.add_trace(
-        go.Scatter(
-            x=X_rows['Dim1'],
-            y=X_rows['Dim2'],
-            mode='markers',
-            name='Films',
-            hovertext=X_rows['title'],
-            hoverinfo='text+x+y',
-            marker=dict(symbol='circle', size=12, opacity=0.8, color=film_colors)
+    def build_mca_overlay_figure(
+        films_plot,
+        cats_plot,
+        dim1_pct=None,
+        dim2_pct=None,
+        show_cat_labels=True,
+        html_out="mca_overlay.html"
+    ):
+        fig = go.Figure()
+
+        # --- Add FILM cluster traces (one trace per cluster) ---
+        film_clusters = sorted(films_plot["film_cluster"].unique())
+        film_trace_idxs = []
+        for cl in film_clusters:
+            sub = films_plot[films_plot["film_cluster"] == cl]
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["Dim1"],
+                    y=sub["Dim2"],
+                    mode="markers",
+                    marker=dict(symbol="circle",size=7),
+                    name=f"Films • Cluster {cl}",
+                    legendgroup="films",
+                    showlegend=True,
+                    customdata=np.stack([sub["film_id"].astype(str), sub["title"].astype(str)], axis=1),
+                    hovertemplate=(
+                        "film_id=%{customdata[0]}<br>"
+                        "title=%{customdata[1]}<br>"
+                        "Dim1=%{x:.4f}<br>"
+                        "Dim2=%{y:.4f}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            film_trace_idxs.append(len(fig.data) - 1)
+
+        # --- Add CATEGORY cluster traces (one trace per cluster) ---
+        cat_clusters = sorted(cats_plot["cat_cluster"].unique())
+        cat_trace_idxs = []
+        for cl in cat_clusters:
+            sub = cats_plot[cats_plot["cat_cluster"] == cl]
+
+            # markers for categories
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["Dim1"],
+                    y=sub["Dim2"],
+                    mode="markers",
+                    marker=dict(symbol="diamond", size=12),
+                    name=f"Categories • Cluster {cl}",
+                    legendgroup="cats",
+                    showlegend=True,
+                    customdata=np.stack([sub["category"].astype(str)], axis=1),
+                    hovertemplate=(
+                        "category=%{customdata[0]}<br>"
+                        "Dim1=%{x:.4f}<br>"
+                        "Dim2=%{y:.4f}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            cat_trace_idxs.append(len(fig.data) - 1)
+
+            # optional text labels (only for label_me categories)
+            if show_cat_labels and "label_me" in sub.columns:
+                sublab = sub[sub["label_me"]].copy()
+                if len(sublab) > 0:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=sublab["Dim1"],
+                            y=sublab["Dim2"],
+                            mode="text",
+                            text=sublab["category"],
+                            textposition="top center",
+                            name=f"Category labels • Cluster {cl}",
+                            legendgroup="cats_labels",
+                            showlegend=False,      # keep legend clean
+                            hoverinfo="skip",
+                            visible=True
+                        )
+                    )
+                    # NOTE: we do not include these in dropdown toggles below by default; we will.
+                    # So we will track them as category-related traces too:
+                    cat_trace_idxs.append(len(fig.data) - 1)
+
+        # --- Dropdown visibility masks ---
+        n = len(fig.data)
+
+        def vis_all_false():
+            return [False] * n
+
+        # Films only: show film traces, hide all cat traces (including labels)
+        vis_films = vis_all_false()
+        for idx in film_trace_idxs:
+            vis_films[idx] = True
+
+        # Categories only: show cat traces, hide film traces
+        vis_cats = vis_all_false()
+        for idx in cat_trace_idxs:
+            vis_cats[idx] = True
+
+        # Both
+        vis_both = [True] * n
+
+        # --- Layout: dropdown + axes labels + selection mode ---
+        xlab = "Dim1" if dim1_pct is None else f"Dim1 ({dim1_pct:.1f}%)"
+        ylab = "Dim2" if dim2_pct is None else f"Dim2 ({dim2_pct:.1f}%)"
+
+        fig.update_layout(
+            title=f"MCA – {dimension}",
+            dragmode="zoom",
+            xaxis=dict(title=xlab, zeroline=True),
+            yaxis=dict(title=ylab, zeroline=True),
+            legend_title_text="Traces (click to toggle clusters)",
+            legend=dict(groupclick="toggleitem"),
+            updatemenus=[
+                dict(
+                    type="dropdown",
+                    direction="down",
+                    x=0.91,
+                    y=1.12,
+                    xanchor="left",
+                    yanchor="top",
+                    showactive=True,
+                    buttons=[
+                        dict(label="Show: Both", method="update", args=[{"visible": vis_both}]),
+                        dict(label="Show: Films only", method="update", args=[{"visible": vis_films}]),
+                        dict(label="Show: Categories only", method="update", args=[{"visible": vis_cats}]),
+                    ],
+                )
+            ],
+            margin=dict(t=120, l=60, r=40, b=50),
+            height=750,
         )
+
+        # Default state: Both visible
+        fig.update_traces(visible=True)
+
+        # Save HTML
+        fig.write_html(html_out, include_plotlyjs="cdn")
+        return fig
+
+
+    # Usage:
+    build_mca_overlay_figure(
+        films_plot=films_plot,
+        cats_plot=cats_plot,
+        dim1_pct=dim1_pct,
+        dim2_pct=dim2_pct,
+        show_cat_labels=True,
+        html_out=HTML_OUT
     )
 
-    # --- Modalities (categories) ---
-    fig.add_trace(
-        go.Scatter(
-            x=X_cols['Dim1'],
-            y=X_cols['Dim2'],
-            mode='markers',
-            name='Categories',
-            text=X_cols['modality'],
-            textposition='top center',
-            hovertext=X_cols['modality'],
-            hoverinfo='text+x+y',
-            marker=dict(symbol='diamond', size=8, opacity=0.6, color = cat_colors)
-        )
-    )
+from scipy.stats import chi2_contingency
 
-    fig.update_layout(
-        title=f"MCA {dimension}",
-        title_x = 0.5,
-        xaxis_title=f"Dimension 1 ({dim1_pct}%)",
-        yaxis_title=f"Dimension 2 ({dim2_pct}%)",
-        template="plotly_white",
-        width=900,
-        height=700,
-        legend=dict(x=0.01, y=0.99)
-    )
+def perm_chi2_pvalue(y_binary: pd.Series,
+                     cluster_labels: pd.Series,
+                     n_perm: int = 5000,
+                     seed: int = 42):
+    """
+    Permutation p-value for association between a binary label y and clusters.
+    Works under sparse counts.
+    """
+    rng = np.random.default_rng(seed)
 
-    return fig
+    # contingency table: rows = cluster, cols = {0,1}
+    ct = pd.crosstab(cluster_labels, y_binary)
+
+    # Ensure both columns exist (0 and 1)
+    if 0 not in ct.columns: ct[0] = 0
+    if 1 not in ct.columns: ct[1] = 0
+    ct = ct[[0, 1]]
+
+    # If degenerate (all 0s or all 1s), no test possible
+    if ct[1].sum() == 0 or ct[0].sum() == 0:
+        return np.nan, np.nan
+
+    # Observed chi-square statistic (no Yates correction; multi-cluster)
+    chi2_obs, _, _, _ = chi2_contingency(ct.values, correction=False)
+
+    # Permutation distribution
+    chi2_perm = np.empty(n_perm, dtype=float)
+    labels = cluster_labels.to_numpy()
+
+    for i in range(n_perm):
+        perm = rng.permutation(labels)
+        ct_perm = pd.crosstab(perm, y_binary).reindex(ct.index, fill_value=0)
+
+        if 0 not in ct_perm.columns: ct_perm[0] = 0
+        if 1 not in ct_perm.columns: ct_perm[1] = 0
+        ct_perm = ct_perm[[0, 1]]
+
+        chi2_perm[i], _, _, _ = chi2_contingency(ct_perm.values, correction=False)
+
+    # p-value = proportion permuted >= observed
+    p = (np.sum(chi2_perm >= chi2_obs) + 1) / (n_perm + 1)
+    return chi2_obs, p
+
+from sklearn.linear_model import LogisticRegression
+
+def fit_ridge_logit_stat(X, y, C=1.0):
+    """
+    Fit ridge logistic regression and return:
+      - coefficients (shape: [n_features])
+      - omnibus statistic: max absolute coefficient
+    """
+    model = LogisticRegression(
+        penalty="l2",
+        C=C,
+        solver="lbfgs",
+        max_iter=1000
+    )
+    model.fit(X, y)
+    coefs = model.coef_.ravel()
+    stat = np.max(np.abs(coefs))
+    return coefs, stat
+
+def perm_omnibus_pvalue(X, y, n_perm=2000, seed=42, C=1.0):
+    """
+    Permutation p-value for association between factors X and binary outcome y.
+    Uses max(|coef|) as statistic. Returns (coefs_obs, stat_obs, pvalue).
+    """
+    rng = np.random.default_rng(seed)
+
+    coefs_obs, stat_obs = fit_ridge_logit_stat(X, y, C=C)
+
+    perm_stats = np.empty(n_perm, dtype=float)
+    for i in range(n_perm):
+        y_perm = rng.permutation(y)
+        _, perm_stats[i] = fit_ridge_logit_stat(X, y_perm, C=C)
+
+    p = (np.sum(perm_stats >= stat_obs) + 1) / (n_perm + 1)
+    return coefs_obs, stat_obs, p

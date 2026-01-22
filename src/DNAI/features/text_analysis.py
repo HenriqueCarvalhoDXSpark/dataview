@@ -1,9 +1,11 @@
 import re
 import numpy as np
+import torch
 
 from nltk.corpus import stopwords
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
+model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 import spacy
 nlp = spacy.load("pt_core_news_lg")
@@ -81,9 +83,6 @@ def lexical_richness(text):
 
 
 def semantic_richness(text):
-    
-    # 1. Load a multilingual model (handles Portuguese)
-    model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
     def chunk_text(text, chunk_size=10, min_words=3):
         """
@@ -128,3 +127,67 @@ def semantic_richness(text):
         return pairwise_dists.mean()
 
     return  semantic_richness_mean_pairwise_cosine(text, chunk_size=10, min_words=3)
+
+def semantic_similarity(row, label_a, label_b, lemma=False):
+    
+    text1 = row[label_a]
+    text2 = row[label_b]
+
+    if lemma:
+        text1 = lemmatize_list([text1])
+        text2 = lemmatize_list([text2])
+
+    # Encode as tensors
+    emb1 = model.encode(text1, convert_to_tensor=True)
+    emb2 = model.encode(text2, convert_to_tensor=True)
+
+    # Cosine similarity (returns a tensor)
+    sim = util.cos_sim(emb1, emb2)
+
+    return sim.item()
+
+def semantic_similarity_intra(row, labels, lemma=False):
+    
+    #texts = row[labels].fillna('').values
+    texts = row[labels].dropna().values
+
+    if lemma:
+        texts = lemmatize_list(texts)
+
+    emb = model.encode(texts, convert_to_tensor=True)
+
+    sim_matrix = util.cos_sim(emb, emb)
+
+    mask = ~torch.eye(sim_matrix.size(0), dtype=bool)
+
+    vals = sim_matrix[mask]
+
+    if vals.numel() == 0:
+        return np.nan
+    
+    else:
+        return vals.max().item()
+    
+    
+def lemmatize_list(text_list):
+    lemmatized = []
+    for doc in nlp.pipe(text_list, batch_size=32):   # fast vectorized processing
+        lemmas = " ".join([token.lemma_ for token in doc])
+        lemmatized.append(lemmas)
+    return lemmatized
+
+def semantic_similarity_inter(row, labels_a, labels_b, lemma=False):
+
+    textsA = row.loc[labels_a].fillna('').values
+    textsB = row.loc[labels_b].fillna('').values
+    
+    if lemma:
+        textsA = lemmatize_list(textsA)
+        textsB = lemmatize_list(textsB)
+    
+    embA = model.encode(textsA, convert_to_tensor=True)
+    embB = model.encode(textsB, convert_to_tensor=True)
+
+    sim_matrix = util.cos_sim(embA, embB)
+
+    return sim_matrix.mean().item()
